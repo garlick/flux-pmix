@@ -16,6 +16,7 @@
 #endif
 #include <pmix.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <flux/optparse.h>
 #include <flux/idset.h>
 
@@ -222,11 +223,24 @@ int main (int argc, char **argv)
     size_t ninfo = parse_info_opts (p, info, sizeof (info) / sizeof (info[0]));
     size_t nprocs = parse_procs_opt (p, &self, &procs);
 
+    /* A fence over explicit procs is collective over those procs only,
+     * so a rank that is not one of them stays out of it.
+     */
+    bool member = (nprocs == 0);
+    for (size_t i = 0; i < nprocs; i++) {
+        if (procs[i].rank == self.rank)
+            member = true;
+    }
+    if (!member) {
+        log_msg ("not a member, skipping fence");
+        goto finalize;
+    }
     if ((rc = PMIx_Fence (procs, nprocs, info, ninfo)))
         log_msg_exit ("PMIx_Fence: %s", PMIx_Error_string (rc));
     if (self.rank == 0)
         log_msg ("completed barrier in %0.3fs.", monotime_since (t) / 1000);
 
+finalize:
     free (procs);
 
     /* Finalize

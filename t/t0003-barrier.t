@@ -8,7 +8,7 @@ BARRIER=${FLUX_BUILD_DIR}/t/src/barrier
 VERSION=${FLUX_BUILD_DIR}/t/src/version
 export FLUX_SHELL_RC_PATH=${FLUX_BUILD_DIR}/t/etc
 
-test_under_flux 2
+test_under_flux 3
 
 test_expect_success 'print pmix library version' '
 	${VERSION}
@@ -107,19 +107,46 @@ test_expect_success '2n2p barrier tolerates optional unknown attr' '
 		${BARRIER} --unknown=42
 '
 
-# N.B. This hangs in openpmix and we never get our fence upcall
-test_expect_success XFAIL '2n2p barrier with procs subset fails' '
-	test_must_fail run_timeout 30 flux run -N2 -n2 \
+# A fence over explicit procs reaches the host once every local
+# participant has entered it.  The server maps the procs to the shells
+# that host them and exchanges among those shells only.  The barrier
+# client skips the fence on ranks that are not members.
+
+test_expect_success '2n2p barrier with all procs explicitly set works' '
+	run_timeout 30 flux run -N2 -n2 \
 		-overbose=2 \
-		${BARRIER} --procs=1
+		${BARRIER} --procs=0-1 2>explicit.err &&
+	grep "completed pmix exchange 0 (all:0)" explicit.err
 '
 
-# This exercises the "subset" code path in our upcall, but only
-# because it assumes non-wildcard proc entry is a subset
-test_expect_success '2n2p barrier with procs explictly set fails' '
-	test_must_fail run_timeout 30 flux run -N2 -n2 \
+# The subset spans both shells, so the exchange is among all shells.
+test_expect_success '2n4p barrier over a subset spanning both shells works' '
+	run_timeout 30 flux run -N2 -n4 \
 		-overbose=2 \
-		${BARRIER} --procs=0-1
+		${BARRIER} --procs=1,2 2>subset.err &&
+	grep "not a member" subset.err | wc -l | grep -x 2 &&
+	grep "flux-shell\[0\].*completed pmix exchange 0 (all:0)" subset.err &&
+	grep "flux-shell\[1\].*completed pmix exchange 0 (all:0)" subset.err
+'
+
+# Flux has three shells here; a fence over ranks on two of them
+# leaves the third out of the exchange.
+test_expect_success '3n3p barrier over a subset of shells works' '
+	run_timeout 30 flux run -N3 -n3 \
+		-overbose=2 \
+		${BARRIER} --procs=0,2 2>subset3.err &&
+	grep "flux-shell\[0\].*completed pmix exchange 0 (0,2:0)" subset3.err &&
+	grep "flux-shell\[2\].*completed pmix exchange 0 (0,2:0)" subset3.err &&
+	test_must_fail grep "flux-shell\[1\].*pmix exchange" subset3.err
+'
+
+# A fence over the procs of one shell completes in openpmix without
+# reaching the host.
+test_expect_success '2n4p barrier over the procs of one shell stays local' '
+	run_timeout 30 flux run -N2 -n4 \
+		-overbose=2 \
+		${BARRIER} --procs=2-3 2>local.err &&
+	test_must_fail grep "pmix exchange" local.err
 '
 
 test_expect_success '2n4p barrier works with pmix.exchange.k=1' '
