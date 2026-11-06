@@ -1,0 +1,201 @@
+/************************************************************\
+ * Copyright 2026 Lawrence Livermore National Security, LLC
+ * (c.f. AUTHORS, NOTICE.LLNS, COPYING)
+ *
+ * This file is part of the Flux resource manager framework.
+ * For details, see https://github.com/flux-framework.
+ *
+ * SPDX-License-Identifier: LGPL-3.0
+\************************************************************/
+
+/* mpi_sessions.c - exercise MPI-4 Sessions over PMIx.
+ *
+ * Derived from t/mpi/sessions.c in flux-core.
+ *
+ * Initializes an MPI Session, builds a communicator from the WORLD process
+ * set, from a proper subset (even ranks), and from the odd ranks in
+ * descending order, and runs a barrier/allreduce on each.  This confirms
+ * that a Session-based MPI job bootstraps and runs correctly over the
+ * pmix shell plugin.
+ *
+ * MPICH >= 5.0 bootstraps each subset communicator with a PMIx fence over
+ * the ranks of its node roots when MPIR_CVAR_PMI_DISABLE_GROUP is 0, and
+ * with whole-job fences otherwise.  Open MPI 5.0 builds it on PMIx groups
+ * instead.  See t1003-mpi-sessions.t, which traces what the server saw.
+ *
+ * Run with '--probe' to test only whether MPI-4 Sessions were compiled in
+ * (returns 0) or not (returns 77 to skip); no MPI runtime is required.
+ */
+
+#if HAVE_CONFIG_H
+#include "config.h"
+#endif
+#include <mpi.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+
+#if !defined(MPI_VERSION) || MPI_VERSION < 4
+
+int main (int argc, char *argv[])
+{
+    fprintf (stderr, "MPI-4 Sessions not supported by this MPI\n");
+    return 77; // skip
+}
+
+#else
+
+/* The session uses MPI_ERRORS_RETURN, so every call must be checked or a
+ * failure is silently swallowed.  Print the message, then the MPI error
+ * string for 'rc' (which with MPICH includes an error stack), and exit.
+ * The output is assembled in one buffer and written with one call so
+ * that it is not interleaved with other ranks' output on unbuffered
+ * stderr.
+ */
+static void die (int rc, const char *fmt, ...)
+{
+    char msg[256];
+    char errstr[MPI_MAX_ERROR_STRING] = "";
+    char buf[sizeof (msg) + sizeof (errstr) + 8];
+    int len;
+    va_list ap;
+
+    va_start (ap, fmt);
+    (void)vsnprintf (msg, sizeof (msg), fmt, ap);
+    va_end (ap);
+    if (rc != MPI_SUCCESS && MPI_Error_string (rc, errstr, &len) != MPI_SUCCESS)
+        errstr[0] = '\0';
+    snprintf (buf,
+              sizeof (buf),
+              "%s%s%s\n",
+              msg,
+              errstr[0] ? ": " : "",
+              errstr);
+    fputs (buf, stderr);
+    exit (1);
+}
+
+/* Build a communicator from the 'n' world ranks in 'ranks' (members only),
+ * barrier on it, and free it.  'name' distinguishes the stringtag passed
+ * to MPI_Comm_create_from_group().
+ */
+static void subset_test (MPI_Group world_group,
+                         int n,
+                         const int *ranks,
+                         const char *name,
+                         int rank)
+{
+    MPI_Group sub;
+    MPI_Comm subcomm;
+    char stringtag[64];
+    int subrank;
+    int rc;
+
+    snprintf (stringtag, sizeof (stringtag), "flux.sessions.%s", name);
+    if ((rc = MPI_Group_incl (world_group, n, ranks, &sub)) != MPI_SUCCESS)
+        die (rc, "%d: MPI_Group_incl %s failed", rank, name);
+    if ((rc = MPI_Group_rank (sub, &subrank)) != MPI_SUCCESS)
+        die (rc, "%d: MPI_Group_rank %s failed", rank, name);
+    if (subrank != MPI_UNDEFINED) {
+        rc = MPI_Comm_create_from_group (sub,
+                                         stringtag,
+                                         MPI_INFO_NULL,
+                                         MPI_ERRORS_RETURN,
+                                         &subcomm);
+        if (rc != MPI_SUCCESS)
+            die (rc, "%d: MPI_Comm_create_from_group %s failed", rank, name);
+        if ((rc = MPI_Barrier (subcomm)) != MPI_SUCCESS)
+            die (rc, "%d: MPI_Barrier %s failed", rank, name);
+        if ((rc = MPI_Comm_free (&subcomm)) != MPI_SUCCESS)
+            die (rc, "%d: MPI_Comm_free %s failed", rank, name);
+    }
+    if ((rc = MPI_Group_free (&sub)) != MPI_SUCCESS)
+        die (rc, "%d: MPI_Group_free %s failed", rank, name);
+}
+
+int main (int argc, char *argv[])
+{
+    MPI_Session sh;
+    MPI_Group world_group;
+    MPI_Comm world;
+    int rank, size;
+    int one = 1, total = 0;
+    int rc;
+
+    if (argc > 1 && strcmp (argv[1], "--probe") == 0)
+        return 0; // MPI-4 Sessions compiled in
+
+    rc = MPI_Session_init (MPI_INFO_NULL, MPI_ERRORS_RETURN, &sh);
+    if (rc != MPI_SUCCESS)
+        die (rc, "MPI_Session_init failed");
+
+    /* Full WORLD group: communicator + barrier + allreduce.
+     */
+    rc = MPI_Group_from_session_pset (sh, "mpi://WORLD", &world_group);
+    if (rc != MPI_SUCCESS)
+        die (rc, "MPI_Group_from_session_pset mpi://WORLD failed");
+    rc = MPI_Comm_create_from_group (world_group,
+                                     "flux.sessions.world",
+                                     MPI_INFO_NULL,
+                                     MPI_ERRORS_RETURN,
+                                     &world);
+    if (rc != MPI_SUCCESS)
+        die (rc, "MPI_Comm_create_from_group WORLD failed");
+    if ((rc = MPI_Comm_rank (world, &rank)) != MPI_SUCCESS)
+        die (rc, "MPI_Comm_rank WORLD failed");
+    if ((rc = MPI_Comm_size (world, &size)) != MPI_SUCCESS)
+        die (rc, "MPI_Comm_size WORLD failed");
+    if ((rc = MPI_Barrier (world)) != MPI_SUCCESS)
+        die (rc, "%d: MPI_Barrier WORLD failed", rank);
+    rc = MPI_Allreduce (&one, &total, 1, MPI_INT, MPI_SUM, world);
+    if (rc != MPI_SUCCESS)
+        die (rc, "%d: MPI_Allreduce WORLD failed", rank);
+    if (total != size)
+        die (MPI_SUCCESS,
+             "%d: MPI_Allreduce WORLD total=%d != size=%d",
+             rank,
+             total,
+             size);
+
+    /* Proper subsets: only members create and barrier on the subset
+     * communicator, exercising a subset group barrier.
+     *
+     * The even ranks in ascending order give an ascending rank list in
+     * the fence.  The odd ranks in descending order give a descending
+     * one: MPICH lists the node roots in communicator rank order, so
+     * reversing the group reverses the list.  The plugin folds the list
+     * into a set of shells, so the order never reaches the server, but
+     * the second subset still costs a fence of its own.
+     */
+    if (size >= 2) {
+        int n = (size + 1) / 2; // count of even ranks in [0, size)
+        int *ranks;
+
+        if (!(ranks = malloc (n * sizeof (int))))
+            die (MPI_SUCCESS, "%d: out of memory", rank);
+        for (int i = 0; i < n; i++)
+            ranks[i] = 2 * i;
+        subset_test (world_group, n, ranks, "even", rank);
+
+        n = size / 2; // count of odd ranks in [0, size)
+        int top = (size - 1) % 2 ? size - 1 : size - 2; // largest odd rank
+        for (int i = 0; i < n; i++)
+            ranks[i] = top - 2 * i;
+        subset_test (world_group, n, ranks, "odd-reversed", rank);
+        free (ranks);
+    }
+    if (rank == 0)
+        printf ("MPI Sessions test OK: size=%d\n", size);
+    if ((rc = MPI_Comm_free (&world)) != MPI_SUCCESS)
+        die (rc, "%d: MPI_Comm_free WORLD failed", rank);
+    if ((rc = MPI_Group_free (&world_group)) != MPI_SUCCESS)
+        die (rc, "%d: MPI_Group_free WORLD failed", rank);
+    if ((rc = MPI_Session_finalize (&sh)) != MPI_SUCCESS)
+        die (rc, "%d: MPI_Session_finalize failed", rank);
+    return 0;
+}
+
+#endif
+
+// vi: ts=4 sw=4 expandtab

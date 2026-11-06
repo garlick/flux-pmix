@@ -30,7 +30,8 @@ if HAVE_MPI
 check_PROGRAMS += \
 	mpi_hello \
 	mpi_abort \
-	mpi_pingpong
+	mpi_pingpong \
+	mpi_sessions
 endif
 
 check_LTLIBRARIES = libtestutil.la
@@ -84,6 +85,9 @@ mpi_hello_LDADD = $(test_ldadd)
 
 mpi_version_SOURCES = mpi_version.c
 mpi_version_LDADD = $(test_ldadd)
+
+mpi_sessions_SOURCES = mpi_sessions.c
+mpi_sessions_LDADD = $(test_ldadd)
 
 mpi_abort_SOURCES = mpi_abort.c
 mpi_abort_LDADD = $(test_ldadd)

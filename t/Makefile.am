@@ -39,7 +39,8 @@ TESTSCRIPTS = \
 	t0014-version.t \
 	t0015-query.t \
 	t1000-mpi-basic.t \
-	t1002-mpi-abort.t
+	t1002-mpi-abort.t \
+	t1003-mpi-sessions.t
 
 # make check runs these TAP tests directly (both scripts and programs)
 TESTS = \
