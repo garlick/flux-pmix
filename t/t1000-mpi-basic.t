@@ -147,7 +147,7 @@ test_expect_success MPICH '2n4p business card fence completes' '
 	run_timeout 30 flux run -N2 -n4 -overbose=2 \
 		${MPI_HELLO} 2>fence.err >hello_fence.out &&
 	grep "There are 4 tasks" hello_fence.out &&
-	grep "completed pmix exchange 0: .*SUCCESS$" fence.err
+	grep "completed pmix exchange 0 (all:0): .*SUCCESS$" fence.err
 '
 
 test_expect_success '1n2p pingpong works' '

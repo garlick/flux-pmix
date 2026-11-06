@@ -15,16 +15,22 @@
  * them through the plugin stack.  See flux-shell-plugins(7).
  *
  * On each fence, the shell puts the blob from openpmix under a key
- * named for its rank.  Then it enters an exchange among all shells.
- * The result has one blob from each shell.  The blobs are concatenated
- * for the fence_nb callback, in any order.
+ * named for its rank.  Then it enters an exchange among the shells
+ * that host the fence procs.  The result has one blob from each of
+ * those shells.  The blobs are concatenated for the fence_nb callback,
+ * in any order.
  *
- * The exchange tag is a sequence number.  All shells see the same
- * sequence of fences, so their tags agree.
+ * openpmix passes a fence over explicit procs to the host when all
+ * local procs have entered it.  The procs are mapped to the shells
+ * that host them.  That set of shells is the exchange participants.
+ * The exchange tag is the set of shells and a sequence number for
+ * that set.  Clients may list the procs in any order, but the set is
+ * the same, so the tags agree on all shells.
  *
  * The shell puts a blob on each fence.  If the fence does not collect
- * data, the blob is empty.  This prevents an old blob from being
- * exchanged again.
+ * data, the blob is empty.  A jobdict carries a key put before a
+ * subset exchange forward to the next exchange among all shells.  The
+ * empty blob prevents an old blob from being exchanged again.
  */
 
 #if HAVE_CONFIG_H
@@ -36,6 +42,8 @@
 #include <jansson.h>
 #include <flux/core.h>
 #include <flux/shell.h>
+#include <flux/idset.h>
+#include <flux/taskmap.h>
 #include <pmix.h>
 #include <pmix_server.h>
 
@@ -60,12 +68,24 @@ struct fence_call {
     struct fence_call *next;    // next fence in progress
 };
 
+/* The sequence number of the next exchange over a set of shells.
+ */
+struct fence_seq {
+    char *set;                  // encoded idset of shells, or "all"
+    int seq;
+    struct fence_seq *next;
+};
+
 struct fence {
     flux_shell_t *shell;
     struct interthread *it;
+    const struct taskmap *taskmap;
+    int shell_rank;
+    int shell_size;
     char key[32];               // this shell's jobdict key
     int trace_flag;
     int exchange_seq;
+    struct fence_seq *seqs;     // one per set of shells seen
     struct fence_call *calls;   // fences in progress, found by tag
 };
 
@@ -244,8 +264,9 @@ static int exchange_exit_cb (flux_plugin_t *p,
     }
     status = PMIX_SUCCESS;
 done:
-    shell_trace ("completed pmix exchange %d: size %zu %s",
+    shell_trace ("completed pmix exchange %d (%s): size %zu %s",
                  fxcall->exchange_seq,
+                 fxcall->tag,
                  ndata,
                  PMIx_Error_string (status));
     // openpmix frees data when the fence is complete
@@ -279,6 +300,113 @@ static int parse_fence_attr (struct fence_call *fxcall, pmix_info_t *info)
     return 0;
 }
 
+/* Return the next sequence number for exchanges over set.
+ * Return -1 on failure.
+ */
+static int seq_next (struct fence *fx, const char *set)
+{
+    struct fence_seq *fs;
+
+    for (fs = fx->seqs; fs != NULL; fs = fs->next) {
+        if (!strcmp (fs->set, set))
+            return fs->seq++;
+    }
+    if (!(fs = calloc (1, sizeof (*fs))) || !(fs->set = strdup (set))) {
+        free (fs);
+        return -1;
+    }
+    fs->next = fx->seqs;
+    fx->seqs = fs;
+    return fs->seq++;
+}
+
+/* Map the fence procs to the shells that host them.
+ * Return the set of shells as a new idset.  Return NULL if the set is
+ * all shells, or on error.  Set *statusp to PMIX_SUCCESS or an error.
+ * A fence over one wildcard proc is over all shells.
+ */
+static struct idset *participants_create (struct fence *fx,
+                                          struct fence_call *fxcall,
+                                          int *statusp)
+{
+    struct idset *ids = NULL;
+    int status = PMIX_ERR_NOT_SUPPORTED;
+
+    if (fxcall->nprocs == 0) {
+        status = PMIX_ERR_BAD_PARAM;
+        goto error;
+    }
+    if (!(ids = idset_create (0, IDSET_FLAG_AUTOGROW))) {
+        status = PMIX_ERR_NOMEM;
+        goto error;
+    }
+    for (size_t i = 0; i < fxcall->nprocs; i++) {
+        const pmix_proc_t *proc = &fxcall->procs[i];
+        int nodeid;
+
+        if (strcmp (proc->nspace, fxcall->procs[0].nspace) != 0) {
+            shell_warn ("fence over multiple namespaces is not supported");
+            goto error;
+        }
+        if (proc->rank == PMIX_RANK_WILDCARD) {
+            if (fxcall->nprocs != 1) {
+                shell_warn ("fence mixes wildcard and explicit ranks");
+                goto error;
+            }
+            idset_destroy (ids);
+            *statusp = PMIX_SUCCESS;
+            return NULL;
+        }
+        if ((nodeid = taskmap_nodeid (fx->taskmap, proc->rank)) < 0) {
+            shell_warn ("fence names rank %u, which is not in the job",
+                        (unsigned int)proc->rank);
+            status = PMIX_ERR_BAD_PARAM;
+            goto error;
+        }
+        if (idset_set (ids, nodeid) < 0) {
+            status = PMIX_ERR_NOMEM;
+            goto error;
+        }
+    }
+    if (!idset_test (ids, fx->shell_rank)) {
+        shell_warn ("fence over procs that are not local reached the host");
+        goto error;
+    }
+    if (idset_count (ids) == fx->shell_size) {
+        idset_destroy (ids);
+        ids = NULL;
+    }
+    *statusp = PMIX_SUCCESS;
+    return ids;
+error:
+    idset_destroy (ids);
+    *statusp = status;
+    return NULL;
+}
+
+/* Create the exchange tag for a fence over ids, or over all shells if
+ * ids is NULL.  The tag is the set of shells and a sequence number
+ * for that set.  Return NULL on failure.
+ */
+static char *tag_create (struct fence *fx, const struct idset *ids)
+{
+    char *set = NULL;
+    char *tag = NULL;
+    int seq;
+
+    if (ids) {
+        if (!(set = idset_encode (ids, IDSET_FLAG_RANGE)))
+            return NULL;
+    }
+    else if (!(set = strdup ("all")))
+        return NULL;
+    if ((seq = seq_next (fx, set)) < 0
+        || asprintf (&tag, "%s:%d", set, seq) < 0)
+        tag = NULL;
+    free (set);
+    return tag;
+}
+
 static void fence_shell_cb (const flux_msg_t *msg, void *arg)
 {
     struct fence *fx = arg;
@@ -289,6 +417,8 @@ static void fence_shell_cb (const flux_msg_t *msg, void *arg)
     json_t *xcbdata;
     json_t *xempty = NULL;
     struct fence_call *fxcall;
+    struct idset *participants = NULL;
+    char *participants_str = NULL;
     int rc;
 
     if (!(fxcall = fence_call_create (fx))
@@ -312,30 +442,36 @@ static void fence_shell_cb (const flux_msg_t *msg, void *arg)
         fence_call_destroy (fxcall);
         return;
     }
-    if (fxcall->nprocs != 1
-        || fxcall->procs[0].rank != PMIX_RANK_WILDCARD) {
-        shell_warn ("fence over proc subset is not supported by flux");
-        rc = PMIX_ERR_NOT_SUPPORTED;
-        goto error;
-    }
     for (int i = 0; i < fxcall->ninfo; i++) {
         rc = parse_fence_attr (fxcall, &fxcall->info[i]);
         if (rc != PMIX_SUCCESS)
             goto error;
+    }
+    participants = participants_create (fx, fxcall, &rc);
+    if (rc != PMIX_SUCCESS)
+        goto error;
+    if (participants) {
+        participants_str = idset_encode (participants, IDSET_FLAG_RANGE);
+        if (!participants_str) {
+            shell_warn ("error encoding fence participants");
+            rc = PMIX_ERR_NOMEM;
+            goto error;
+        }
     }
     if (!(xempty = codec_data_encode (NULL, 0))) {
         shell_warn ("error encoding empty fence data");
         rc = PMIX_ERR_NOMEM;
         goto error;
     }
-    if (asprintf (&fxcall->tag, "%d", fxcall->exchange_seq) < 0) {
+    if (!(fxcall->tag = tag_create (fx, participants))) {
         shell_warn ("error creating fence exchange tag");
         rc = PMIX_ERR_NOMEM;
         goto error;
     }
     if (fx->trace_flag) {
-        shell_trace ("starting pmix exchange %d: size %zi",
+        shell_trace ("starting pmix exchange %d (%s): size %zi",
                      fxcall->exchange_seq,
+                     fxcall->tag,
                      fxcall->collect ? codec_data_length (xdata) : 0);
     }
     /* Put the blob.  If the fence does not collect data, put an empty
@@ -358,18 +494,23 @@ static void fence_shell_cb (const flux_msg_t *msg, void *arg)
     if (jobdict_call (fx,
                       "jobdict.exchange",
                       NULL,
-                      "{s:s s:s s:s}",
+                      "{s:s s:s s:s? s:s}",
                       "name", FENCE_JOBDICT,
                       "tag", fxcall->tag,
+                      "participants", participants_str,
                       "exit_topic", FENCE_EXIT_TOPIC) < 0) {
         (void)calls_pop (fx, fxcall->tag);
         rc = PMIX_ERROR;
         goto error;
     }
     json_decref (xempty);
+    free (participants_str);
+    idset_destroy (participants);
     return;
 error:
     json_decref (xempty);
+    free (participants_str);
+    idset_destroy (participants);
     fxcall->cbfunc (rc, NULL, 0, fxcall->cbdata, NULL, NULL);
     fence_call_destroy (fxcall);
 }
@@ -428,6 +569,12 @@ void fence_destroy (struct fence *fx)
             fx->calls = fxcall->next;
             fence_call_destroy (fxcall);
         }
+        while (fx->seqs) {
+            struct fence_seq *fs = fx->seqs;
+            fx->seqs = fs->next;
+            free (fs->set);
+            free (fs);
+        }
         free (fx);
         errno = saved_errno;
         global_fence_ctx = NULL;
@@ -442,16 +589,20 @@ struct fence *fence_create (flux_plugin_t *p,
     struct fence *fx;
     flux_plugin_arg_t *args;
     const char *name = NULL;
-    int shell_rank;
 
     if (!(fx = calloc (1, sizeof (*fx))))
         return NULL;
     fx->shell = shell;
     fx->it = it;
     fx->trace_flag = 1; // stuck on for now
-    if (flux_shell_info_unpack (shell, "{s:i}", "rank", &shell_rank) < 0)
+    if (flux_shell_info_unpack (shell,
+                                "{s:i s:i}",
+                                "rank", &fx->shell_rank,
+                                "size", &fx->shell_size) < 0)
         goto error;
-    snprintf (fx->key, sizeof (fx->key), "%d", shell_rank);
+    if (!(fx->taskmap = flux_shell_get_taskmap (shell)))
+        goto error;
+    snprintf (fx->key, sizeof (fx->key), "%d", fx->shell_rank);
     if (interthread_register (it, "fence_upcall", fence_shell_cb, fx) < 0)
         goto error;
     if (flux_plugin_add_handler (p,
