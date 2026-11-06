@@ -297,11 +297,13 @@ Chapter 8 of the Standard, Synchronization.
 
    * - :func:`PMIx_Fence`
      - yes
-     - Whole job only.
+     - Over the whole job or any subset of its ranks.
 
 A fence over the ranks of one node completes in OpenPMIx without
-reaching the host.  A fence over any other subset of ranks fails with
-``PMIX_ERR_NOT_SUPPORTED``.
+reaching the host.  Any other fence is an exchange among the shells
+that host its ranks, on the job dictionary that flux-core's jobdict
+shell plugin provides.  A fence over ranks in another namespace fails
+with ``PMIX_ERR_NOT_SUPPORTED``.
 
 Publish/Lookup Operations
 -------------------------
